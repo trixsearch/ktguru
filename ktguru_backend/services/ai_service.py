@@ -6,6 +6,7 @@ import json
 import logging
 import re
 import threading
+import httpx  # <-- Added this import
 from typing import Any
 
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -57,10 +58,14 @@ class AIService:
         if not settings.GROQ_API_KEY:
             raise ValueError("GROQ_API_KEY is not set")
         if self._llm is None:
+            # <-- Added custom HTTP client to bypass local SSL blocks
+            custom_http_client = httpx.Client(verify=False) 
+            
             self._llm = ChatGroq(
                 model=settings.GROQ_MODEL,
                 api_key=settings.GROQ_API_KEY,
                 temperature=0.2,
+                http_client=custom_http_client # <-- Passed it to the LLM
             )
         return self._llm
 
