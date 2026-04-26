@@ -14,3 +14,10 @@ langchain-text-splitters>=0.3.0
 sentence-transformers>=3.0.0
 faiss-cpu>=1.8.0
 huggingface-hub
+pandas>=2.2.0
+openpyxl>=3.1.0
+# xlrd 2+ does not read legacy .xls; keep 1.x for read_excel(engine="xlrd") on .xls
+xlrd>=1.2.0,<2.0.0
+python-docx>=1.1.0
+httpx
+certifi

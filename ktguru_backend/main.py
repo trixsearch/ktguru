@@ -3,10 +3,15 @@ KT Guru — FastAPI RAG API for knowledge transfer.
 """
 from __future__ import annotations
 
+import io
 import logging
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
+
+import pandas as pd
+from docx import Document as DocxDocument
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,8 +67,83 @@ def root() -> dict[str, str]:
     return {"service": "KT Guru API", "docs": "/docs"}
 
 
-TEXT_FILENAME_RE = re.compile(r"^[\w\-. ]+\.txt$", re.IGNORECASE)
+# Safe basename + allowed extensions for multi-format uploads (same 5 MB cap as before)
+UPLOAD_FILENAME_RE = re.compile(
+    r"^[\w\-. ]+\.(?:txt|py|java|js|xml|yaml|json|html|csv|xlsx|xls|docx)$",
+    re.IGNORECASE,
+)
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+
+_UTF8_TEXT_EXTS = frozenset(
+    {"txt", "py", "java", "js", "xml", "yaml", "json", "html"}
+)
+_CSV_EXT = "csv"
+_EXCEL_EXTS = frozenset({"xlsx", "xls"})
+_DOCX_EXT = "docx"
+
+
+def _file_ext(filename: str) -> str:
+    return Path(filename).suffix.lower().lstrip(".")
+
+
+def _extract_text_from_file(filename: str, raw: bytes) -> str:
+    """
+    Decode or parse uploaded bytes to plain text for the same
+    RecursiveCharacterTextSplitter + FAISS path as the original .txt flow.
+    """
+    ext = _file_ext(filename)
+
+    if ext in _UTF8_TEXT_EXTS:
+        try:
+            return raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as e:
+            raise HTTPException(
+                status_code=400,
+                detail="File must be valid UTF-8 text",
+            ) from e
+
+    if ext == _CSV_EXT:
+        buf = io.BytesIO(raw)
+        try:
+            df = pd.read_csv(buf)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not parse CSV file",
+            ) from e
+        return df.to_string()
+
+    if ext in _EXCEL_EXTS:
+        buf = io.BytesIO(raw)
+        try:
+            if ext == "xlsx":
+                df = pd.read_excel(buf, engine="openpyxl")
+            else:
+                df = pd.read_excel(buf, engine="xlrd")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not parse Excel file",
+            ) from e
+        return df.to_string()
+
+    if ext == _DOCX_EXT:
+        buf = io.BytesIO(raw)
+        try:
+            document = DocxDocument(buf)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not parse Word document",
+            ) from e
+        parts: list[str] = []
+        for p in document.paragraphs:
+            t = (p.text or "").strip()
+            if t:
+                parts.append(t)
+        return "\n\n".join(parts) if parts else ""
+
+    raise HTTPException(status_code=400, detail="Unsupported file type")
 
 
 def get_ai() -> AIService:
@@ -91,27 +171,22 @@ def _split_document(text: str) -> list[str]:
 
 @app.post("/api/upload")
 async def upload_document(
-    file: UploadFile = File(..., description="Plain text .txt file"),
+    file: UploadFile = File(..., description="Document file to index (text, code, CSV, Excel, or DOCX)"),
     db: AsyncSession = Depends(get_db),
     ai: AIService = Depends(get_ai_dep),
 ) -> dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is required")
-    if not TEXT_FILENAME_RE.match(file.filename):
+    if not UPLOAD_FILENAME_RE.match(file.filename):
         raise HTTPException(
             status_code=400,
-            detail="Only .txt filenames with safe characters are accepted",
+            detail="Unsupported file type or filename; use a supported extension and safe characters",
         )
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 5 MB)")
-    try:
-        text = raw.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        raise HTTPException(
-            status_code=400,
-            detail="File must be valid UTF-8 text",
-        ) from None
+
+    text = _extract_text_from_file(file.filename, raw)
 
     chunks = _split_document(text)
     if not chunks:
