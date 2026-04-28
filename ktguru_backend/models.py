@@ -62,3 +62,21 @@ class UnansweredQuestion(Base):
         DateTime,
         server_default=func.current_timestamp(),
     )
+
+
+class Issue(Base):
+    """Structured issue rows from CSV/Excel KT uploads (issues table)."""
+
+    __tablename__ = "issues"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    document_id: Mapped[int | None] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    subject: Mapped[str] = mapped_column(Text, nullable=False)
+    raised_by: Mapped[str] = mapped_column(String(512), nullable=False)
+    raised_on: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    resolution_time: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resolution: Mapped[str | None] = mapped_column(Text, nullable=True)

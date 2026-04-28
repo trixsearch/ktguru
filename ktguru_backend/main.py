@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import io
 import logging
-import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -21,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
 from database import get_db
-from models import Document, DocumentChunk, UnansweredQuestion
+from models import Document, DocumentChunk, Issue, UnansweredQuestion
 from schemas import AskRequest, AskResponse
 from services.ai_service import AIService
 import os
@@ -67,23 +66,102 @@ def root() -> dict[str, str]:
     return {"service": "KT Guru API", "docs": "/docs"}
 
 
-# Safe basename + allowed extensions for multi-format uploads (same 5 MB cap as before)
-UPLOAD_FILENAME_RE = re.compile(
-    r"^[\w\-. ]+\.(?:txt|py|java|js|xml|yaml|json|html|csv|xlsx|xls|docx)$",
-    re.IGNORECASE,
-)
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
 _UTF8_TEXT_EXTS = frozenset(
     {"txt", "py", "java", "js", "xml", "yaml", "json", "html"}
 )
 _CSV_EXT = "csv"
-_EXCEL_EXTS = frozenset({"xlsx", "xls"})
 _DOCX_EXT = "docx"
+_TABULAR_EXTS = frozenset({_CSV_EXT, "xlsx", "xls"})
+_ALLOWED_UPLOAD_EXTS = _UTF8_TEXT_EXTS | _TABULAR_EXTS | {_DOCX_EXT}
+
+# Structured KT columns (CSV / Excel)
+_ISSUE_COLUMNS: tuple[str, ...] = (
+    "Subject",
+    "Raised By",
+    "Raised On",
+    "Resolution Time",
+    "Status",
+    "Resolution",
+)
 
 
 def _file_ext(filename: str) -> str:
     return Path(filename).suffix.lower().lstrip(".")
+
+
+def _scalar_str(val: Any) -> str:
+    if pd.isna(val):
+        return ""
+    return str(val).strip()
+
+
+def _read_tabular_dataframe(filename: str, raw: bytes) -> pd.DataFrame:
+    ext = _file_ext(filename)
+    buf = io.BytesIO(raw)
+    if ext == _CSV_EXT:
+        return pd.read_csv(buf)
+    if ext == "xlsx":
+        return pd.read_excel(buf, engine="openpyxl")
+    if ext == "xls":
+        return pd.read_excel(buf, engine="xlrd")
+    raise ValueError("Unsupported tabular file type")
+
+
+def _normalize_and_validate_issues_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    missing = [c for c in _ISSUE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError("Missing required columns: " + ", ".join(missing))
+    df = df[list(_ISSUE_COLUMNS)].copy()
+    if len(df) == 0:
+        raise ValueError("No data rows found in file.")
+    df["Raised On"] = pd.to_datetime(df["Raised On"], errors="coerce")
+    if df["Raised On"].isna().any():
+        n_bad = int(df["Raised On"].isna().sum())
+        raise ValueError(
+            f"'Raised On' must contain valid dates for all rows ({n_bad} invalid or empty)."
+        )
+    return df
+
+
+def _issue_row_rich_context(row: pd.Series) -> str:
+    subj = _scalar_str(row["Subject"]) or "(no subject)"
+    raised_by = _scalar_str(row["Raised By"])
+    status = _scalar_str(row["Status"])
+    res_time = _scalar_str(row["Resolution Time"])
+    resolution = _scalar_str(row["Resolution"])
+    ro = row["Raised On"]
+    if pd.isna(ro):
+        date_disp = ""
+    else:
+        ts = pd.Timestamp(ro)
+        date_disp = ts.strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"Subject: {subj} | Status: {status} | Raised By: {raised_by} | "
+        f"Date: {date_disp} | Resolution Time: {res_time} | Resolution: {resolution}"
+    )
+
+
+def _issue_row_to_model(document_id: int, row: pd.Series) -> Issue:
+    ro = row["Raised On"]
+    dt = pd.Timestamp(ro).to_pydatetime() if not pd.isna(ro) else None
+    subj = _scalar_str(row["Subject"]) or "(no subject)"
+    rb = _scalar_str(row["Raised By"]) or "—"
+    rt = _scalar_str(row["Resolution Time"])
+    st = _scalar_str(row["Status"])
+    res = _scalar_str(row["Resolution"])
+    return Issue(
+        document_id=document_id,
+        subject=subj,
+        raised_by=rb,
+        raised_on=dt,
+        resolution_time=rt or None,
+        status=st or None,
+        resolution=res or None,
+    )
 
 
 def _extract_text_from_file(filename: str, raw: bytes) -> str:
@@ -101,31 +179,6 @@ def _extract_text_from_file(filename: str, raw: bytes) -> str:
                 status_code=400,
                 detail="File must be valid UTF-8 text",
             ) from e
-
-    if ext == _CSV_EXT:
-        buf = io.BytesIO(raw)
-        try:
-            df = pd.read_csv(buf)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail="Could not parse CSV file",
-            ) from e
-        return df.to_string()
-
-    if ext in _EXCEL_EXTS:
-        buf = io.BytesIO(raw)
-        try:
-            if ext == "xlsx":
-                df = pd.read_excel(buf, engine="openpyxl")
-            else:
-                df = pd.read_excel(buf, engine="xlrd")
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail="Could not parse Excel file",
-            ) from e
-        return df.to_string()
 
     if ext == _DOCX_EXT:
         buf = io.BytesIO(raw)
@@ -177,20 +230,12 @@ async def upload_document(
 ) -> dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename is required")
-    if not UPLOAD_FILENAME_RE.match(file.filename):
-        raise HTTPException(
-            status_code=400,
-            detail="Unsupported file type or filename; use a supported extension and safe characters",
-        )
+    ext = _file_ext(file.filename)
+    if ext not in _ALLOWED_UPLOAD_EXTS:
+        raise HTTPException(status_code=400, detail="Unsupported file type")
     raw = await file.read()
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="File too large (max 5 MB)")
-
-    text = _extract_text_from_file(file.filename, raw)
-
-    chunks = _split_document(text)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No text content to index after splitting")
 
     doc = Document(filename=file.filename)
     db.add(doc)
@@ -199,16 +244,61 @@ async def upload_document(
 
     meta_batch: list[dict[str, Any]] = []
     text_batch: list[str] = []
+    chunk_count: int
 
-    for i, chunk_text in enumerate(chunks):
-        db.add(
-            DocumentChunk(
-                document_id=doc.id,
-                chunk_text=chunk_text,
-                chunk_index=i,
+    if ext in _TABULAR_EXTS:
+        try:
+            df = _read_tabular_dataframe(file.filename, raw)
+            df = _normalize_and_validate_issues_df(df)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        except Exception:
+            logger.exception("Tabular ingest failed")
+            raise HTTPException(
+                status_code=400,
+                detail="The file is corrupted or could not be read. Required columns: "
+                + ", ".join(_ISSUE_COLUMNS),
+            ) from None
+
+        chunk_index = 0
+        for _, row in df.iterrows():
+            db.add(_issue_row_to_model(doc.id, row))
+            db.add(
+                DocumentChunk(
+                    document_id=doc.id,
+                    chunk_text=_issue_row_rich_context(row),
+                    chunk_index=chunk_index,
+                )
             )
-        )
-    await db.flush()
+            chunk_index += 1
+        chunk_count = chunk_index
+        await db.flush()
+    else:
+        try:
+            text = _extract_text_from_file(file.filename, raw)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Document extraction failed")
+            raise HTTPException(
+                status_code=400,
+                detail="The file is corrupted or could not be read.",
+            ) from e
+
+        chunks = _split_document(text)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No text content to index after splitting")
+
+        for i, chunk_text in enumerate(chunks):
+            db.add(
+                DocumentChunk(
+                    document_id=doc.id,
+                    chunk_text=chunk_text,
+                    chunk_index=i,
+                )
+            )
+        chunk_count = len(chunks)
+        await db.flush()
 
     res = await db.execute(
         select(DocumentChunk)
@@ -235,7 +325,7 @@ async def upload_document(
         "status": "ok",
         "document_id": doc.id,
         "filename": file.filename,
-        "chunks": len(chunks),
+        "chunks": chunk_count,
     }
 
 

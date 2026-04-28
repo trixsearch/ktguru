@@ -26,8 +26,15 @@ function App() {
     try {
       await axios.post('http://127.0.0.1:8000/api/upload', formData)
       alert('Document uploaded successfully.')
-    } catch {
-      alert('Document upload failed. Please try again.')
+    } catch (error) {
+      const detail = error.response?.data?.detail
+      const message =
+        detail != null
+          ? typeof detail === 'string'
+            ? detail
+            : JSON.stringify(detail)
+          : 'Document upload failed. Please try again.'
+      alert(message)
     } finally {
       e.target.value = ''
     }
